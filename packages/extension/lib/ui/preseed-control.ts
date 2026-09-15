@@ -5,7 +5,7 @@
 // on preprod — was the only way to get one, and offering it everywhere was
 // right.
 //
-// It is no longer right everywhere. preprod, preview and qanet each ship a
+// It is no longer right everywhere. preprod and preview each ship a
 // reference in the package (see offscreen/bundled-preseed.ts), installed on the
 // first unlock. Offering to build one there is offering an hour of work to arrive
 // at what the user already has on disk. So the control is now scoped to the case

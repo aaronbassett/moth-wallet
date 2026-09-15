@@ -49,9 +49,10 @@ async function fetchText(url: string, gzipped: boolean): Promise<string | null> 
   const response = await fetch(url);
   if (!response.ok) return null;
   if (!gzipped) return response.text();
-  // DecompressionStream keeps the 9.8 MB dust state out of memory in one piece
-  // and is available in workers; the alternative is shipping it uncompressed and
-  // doubling what the package carries.
+  // DecompressionStream is available in workers and keeps the parts compressed in
+  // the package. The dust state was the reason this mattered (megabytes before
+  // its trees were collapsed at export); it is kilobytes now, but a reference cut
+  // without collapsing still loads.
   const stream = response.body?.pipeThrough(new DecompressionStream('gzip'));
   if (!stream) return null;
   return new Response(stream).text();
@@ -109,7 +110,8 @@ export function hasBundledReference(networkId: string): Promise<boolean> {
 }
 
 /**
- * Install the bundled reference for `networkId` if the store has none.
+ * Install the bundled reference for `networkId` if the store has none, or has
+ * an older one.
  *
  * Best-effort and idempotent. A missing or unreadable asset is not an error —
  * not every network ships one, and a wallet without a reference syncs the slow
@@ -122,12 +124,20 @@ export function hasBundledReference(networkId: string): Promise<boolean> {
  */
 export async function installBundledReference(networkId: string, store: SyncStateStore): Promise<boolean> {
   try {
-    // Already present — a locally built or previously installed reference wins,
-    // since it is at least as fresh as anything we ship.
-    if (await store.get(emptyRefHeightKey(networkId))) return false;
-
     const manifest = parseManifest(await fetchText(assetUrl(networkId, 'manifest.json'), false));
     if (!manifest) return false;
+
+    // A reference at least as new as the bundled one wins: one built on this
+    // device, or this same bundle installed on an earlier unlock.
+    //
+    // An OLDER one is replaced. It predates this release, so it is staler than
+    // what the package carries, and one installed by an earlier release was cut
+    // before its dust trees were collapsed — keeping it would have every new
+    // wallet restoring megabytes the package no longer ships. The one cost: an
+    // account created between the two heights and not yet synced now falls to the
+    // `height <= birthday` guard and syncs from genesis, which is slow but correct.
+    const storedHeight = Number((await store.get(emptyRefHeightKey(networkId)))?.trim());
+    if (Number.isFinite(storedHeight) && storedHeight >= manifest.height) return false;
 
     const states: Partial<Record<WalletPart, string>> = {};
     for (const part of PARTS) {
@@ -138,6 +148,12 @@ export async function installBundledReference(networkId: string, store: SyncStat
       states[part] = value;
     }
 
+    // Retire the old height before touching any part. Otherwise a replacement
+    // interrupted midway leaves the new state under the OLD height, and the
+    // birthday guard — which trusts that height — would seed accounts older than
+    // the state they are given, skipping their history. Without a height the
+    // half-written reference is simply ignored.
+    await store.delete(emptyRefHeightKey(networkId));
     for (const part of PARTS) await store.put(emptyRefStateKey(networkId, part), states[part]!);
     // Witnesses before the height, for the same reason the height goes last: the
     // height is what marks the reference usable, and a reference that reads as
