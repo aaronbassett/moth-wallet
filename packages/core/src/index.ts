@@ -134,6 +134,15 @@ export {
   type PortableReference,
   type ReferenceManifest,
 } from './sync/preseed-portable.js';
+export {
+  collapseDustReference,
+  inspectDustSnapshot,
+  DustCollapseError,
+  type DustCollapseFailure,
+  type DustCollapseReport,
+  type DustCollapseResult,
+  type DustSnapshotSummary,
+} from './sync/dust-reference-collapse.js';
 export { chainTip } from './sync/chain-tip.js';
 export { ensureEmptyRefCache, warmEmptyRefCache, clearEmptyRefCache, refreshEmptyRefCache, preseedReferenceStatus, preSeedNewWallet, type WarmProgress } from './sync/preseed.js';
 
