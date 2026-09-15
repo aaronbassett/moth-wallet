@@ -299,3 +299,60 @@ describe('cursor witnesses travel with a bundle', () => {
     expect(target.entries.has(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'shielded'))).toBe(false);
   });
 });
+
+// The extension's committed bundles carry their witnesses INSIDE the manifest
+// (scripts/export-preseed.mjs writes them there), not as witness-<part>.json
+// files. Import used to understand only the files, so a committed bundle imported
+// through the CLI arrived with no witnesses at all — and a preprod bundle cut
+// before an indexer renumbering then imported, refreshed, and failed its sync in
+// a loop rather than being refused.
+describe('witnesses written inline in the manifest', () => {
+  const NET = 'preprod';
+  const INLINE = {
+    shielded: {stream: 'zswapLedgerEvents', id: 1_449_850, digest: 'fc9acd5a4f6ca3a0'},
+    dust: {stream: 'dustLedgerEvents', id: 1_449_980, digest: 'ffdc476b89fca076'},
+  } as const;
+
+  function withManifestWitnesses(witnesses: unknown): PortableReference {
+    const bundle = bundleFor(NET, 2_203_416);
+    return {...bundle, manifest: {...bundle.manifest, witnesses: witnesses as ReferenceManifest['witnesses']}};
+  }
+
+  it('stores them, so an imported extension bundle can be verified', async () => {
+    const store = new MemoryStore();
+
+    await importReference(store, NET, withManifestWitnesses(INLINE));
+
+    expect(JSON.parse(store.entries.get(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'shielded'))!)).toEqual(INLINE.shielded);
+    expect(JSON.parse(store.entries.get(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'dust'))!)).toEqual(INLINE.dust);
+  });
+
+  it('refuses a malformed inline witness, and writes nothing', async () => {
+    // Stored, a witness the verifier cannot parse is skipped — which it treats as
+    // "unverifiable, allow". Evidence that cannot be read is no evidence.
+    const malformed = [
+      {...INLINE, dust: {...INLINE.dust, stream: 'zswapLedgerEvents'}},
+      {...INLINE, dust: {...INLINE.dust, id: 0}},
+      {...INLINE, dust: {...INLINE.dust, digest: 'not-a-digest'}},
+      {...INLINE, shielded: 'fc9acd5a4f6ca3a0'},
+    ];
+    for (const witnesses of malformed) {
+      const store = storeWithReference(NET, 100);
+      const before = new Map(store.entries);
+      await expect(importReference(store, NET, withManifestWitnesses(witnesses))).rejects.toThrow(/malformed/);
+      expect(store.entries).toEqual(before);
+    }
+  });
+
+  it('refuses a bundle whose manifest names a witness file it does not carry', async () => {
+    // What a reader that loads only the .dat.gz parts hands over for a bundle
+    // `exportReference` wrote.
+    const store = storeWithReference(NET, 100);
+    const before = new Map(store.entries);
+
+    await expect(importReference(store, NET, withManifestWitnesses(['shielded', 'dust']))).rejects.toThrow(
+      /witness-shielded\.json/,
+    );
+    expect(store.entries).toEqual(before);
+  });
+});

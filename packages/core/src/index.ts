@@ -131,6 +131,7 @@ export {
   importReference,
   ReferenceImportError,
   REFERENCE_PARTS,
+  REFERENCE_FILE_NAMES,
   type PortableReference,
   type ReferenceManifest,
 } from './sync/preseed-portable.js';

@@ -11,6 +11,7 @@
 // dropped straight into the extension, and one downloaded from a release can be
 // imported here — one format, not two that drift.
 
+import type {CursorWitness} from './cursor-witness.js';
 import {
   cursorWitnessKey,
   emptyRefHeightKey,
@@ -82,16 +83,37 @@ export const REFERENCE_PARTS: readonly WalletPart[] = ['shielded', 'unshielded',
  * indexer-numbered, matching what preseed.ts records and re-checks. Unshielded
  * cursors are transaction ids, which renumbering does not move.
  */
-const WITNESSED_PARTS: readonly WalletPart[] = ['shielded', 'dust'] as const;
+const WITNESSED_PARTS: readonly ('shielded' | 'dust')[] = ['shielded', 'dust'] as const;
+
+/** The indexer stream each witnessed part's cursor numbers into. */
+const WITNESS_STREAM: Record<'shielded' | 'dust', CursorWitness['stream']> = {
+  shielded: 'zswapLedgerEvents',
+  dust: 'dustLedgerEvents',
+};
 
 const witnessFileName = (part: WalletPart): string => `witness-${part}.json`;
+
+/**
+ * Every file a bundle may carry beside its manifest.
+ *
+ * Exported for whatever reads a bundle off disk, so it loads the witnesses along
+ * with the state. The CLI's `preseed import` once listed the three `.dat.gz`
+ * parts by hand and nothing else, which quietly dropped every witness a bundle
+ * carried: imported references were all unverifiable, and one cut before a
+ * renumbering imported cleanly and then failed its sync in a loop instead of
+ * being refused.
+ */
+export const REFERENCE_FILE_NAMES: readonly string[] = [
+  ...REFERENCE_PARTS.map((part) => `${part}.dat.gz`),
+  ...WITNESSED_PARTS.map(witnessFileName),
+];
 
 export interface ReferenceManifest {
   network: string;
   height: number;
   parts: Record<string, { bytes: number; gzipBytes: number }>;
   /**
-   * Parts whose cursor witness travels with the bundle, as `witness-<part>.json`.
+   * The cursor witnesses a bundle carries.
    *
    * A witness proves that the event a cursor names is still the same event. That
    * question is only answerable with the witness recorded where the reference was
@@ -100,9 +122,16 @@ export interface ReferenceManifest {
    * cannot be verified here — which matters most for a bundle, since crossing
    * machines is exactly how a reference meets a differently-numbered indexer.
    *
+   * Two shapes, one per writer, and a bundle carries one of them:
+   *
+   * - a list of part names, each witness travelling as `witness-<part>.json`,
+   *   which is what `exportReference` writes
+   * - the witnesses themselves keyed by part, which is what
+   *   `scripts/export-preseed.mjs` writes into the extension's committed bundles
+   *
    * Optional: bundles cut before witnesses existed do not have it.
    */
-  witnesses?: readonly string[];
+  witnesses?: readonly string[] | Readonly<Record<string, CursorWitness>>;
 }
 
 /** A reference in transit: the manifest plus each part's gzipped bytes. */
@@ -178,6 +207,70 @@ export class ReferenceImportError extends Error {
 }
 
 /**
+ * Check a witness written inline in a manifest, and return it in stored form.
+ *
+ * Inline witnesses are parsed out of a hand-promoted manifest rather than copied
+ * from a store that wrote them, so their shape is checked before anything trusts
+ * them. A witness the verifier cannot read is skipped by the verifier, and a
+ * skipped witness is treated as "unverifiable, allow" — so storing a malformed
+ * one would be the same as storing none, while looking like evidence.
+ */
+function inlineWitness(part: 'shielded' | 'dust', value: unknown): string {
+  const stream = WITNESS_STREAM[part];
+  const {id, digest, stream: declared} = (typeof value === 'object' && value !== null ? value : {}) as Partial<CursorWitness>;
+  if (
+    declared !== stream ||
+    typeof id !== 'number' ||
+    !Number.isSafeInteger(id) ||
+    id <= 0 ||
+    typeof digest !== 'string' ||
+    !/^[0-9a-f]{16}$/.test(digest)
+  ) {
+    throw new ReferenceImportError(
+      `The manifest's ${part} witness is malformed — expected {"stream": "${stream}", "id": <positive integer>, ` +
+        '"digest": <16 hex characters>}. A witness that cannot be read cannot vouch for the cursor, so the bundle is refused.',
+    );
+  }
+  return JSON.stringify({stream, id, digest} satisfies CursorWitness);
+}
+
+/**
+ * The witness each witnessed part carries, in the form the store keeps.
+ *
+ * Validates before anything is written, alongside the parts, so a bundle with
+ * broken evidence changes nothing on this machine.
+ */
+function carriedWitnesses(bundle: PortableReference): Map<'shielded' | 'dust', string> {
+  const declared = bundle.manifest.witnesses;
+  const listed: readonly string[] = Array.isArray(declared) ? declared : [];
+  const inline = declared !== undefined && !Array.isArray(declared)
+    ? (declared as Readonly<Record<string, unknown>>)
+    : undefined;
+
+  const carried = new Map<'shielded' | 'dust', string>();
+  const decoder = new TextDecoder();
+  for (const part of WITNESSED_PARTS) {
+    const file = bundle.files.get(witnessFileName(part));
+    if (file) {
+      carried.set(part, decoder.decode(file));
+      continue;
+    }
+    // Named in the manifest but not delivered is a bundle that lost its evidence
+    // in transit — exactly what a reader that only loads the `.dat.gz` parts
+    // produces. Importing it would store a reference that cannot be verified
+    // while its own manifest says it can be.
+    if (listed.includes(part)) {
+      throw new ReferenceImportError(
+        `The manifest lists a ${part} witness, but ${witnessFileName(part)} is not in the bundle. ` +
+          'Refusing to import a reference whose cursor evidence went missing on the way here.',
+      );
+    }
+    if (inline && inline[part] !== undefined) carried.set(part, inlineWitness(part, inline[part]));
+  }
+  return carried;
+}
+
+/**
  * Write a bundle into this machine's store as the reference for its network.
  *
  * Refuses rather than guesses:
@@ -186,9 +279,11 @@ export class ReferenceImportError extends Error {
  *   never been on, and the mismatch is silent afterwards
  * - a bundle older than what is already here is a downgrade, and downgrading a
  *   reference costs catch-up time on every wallet created from then on
+ * - a bundle whose witnesses are named but missing, or malformed, would store a
+ *   reference that looks verifiable and is not
  *
- * `force` overrides the second, because re-importing a known-good older bundle
- * to replace a corrupt newer one is a real thing to want.
+ * `force` overrides the downgrade check, because re-importing a known-good older
+ * bundle to replace a corrupt newer one is a real thing to want.
  */
 export async function importReference(
   store: SyncStateStore,
@@ -243,6 +338,7 @@ export async function importReference(
       throw new ReferenceImportError(`${part}.dat.gz is not valid gzip: ${String(err)}`);
     }
   }
+  const witnesses = carriedWitnesses(bundle);
 
   // Parts first, height last. The height key is what `preseedReferenceStatus`
   // and the seeding guard read to decide a reference is usable, so writing it
@@ -259,11 +355,10 @@ export async function importReference(
   // declare the newly imported one valid — a stale witness vouching for state it
   // was never taken from. Absent witnesses leave the reference unverifiable,
   // which the pre-seed guard reports and allows; a wrong one it silently trusts.
-  const decoder2 = new TextDecoder();
   for (const part of WITNESSED_PARTS) {
     const key = cursorWitnessKey(networkId, EMPTY_REF_WALLET, part);
-    const carried = bundle.files.get(witnessFileName(part));
-    if (carried) await store.put(key, decoder2.decode(carried));
+    const carried = witnesses.get(part);
+    if (carried) await store.put(key, carried);
     else await store.delete(key);
   }
 

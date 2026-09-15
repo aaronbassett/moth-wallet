@@ -1,5 +1,3 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
 import { Args, Flags } from '@oclif/core';
 import { BaseCommand } from '../../base-command.js';
 import {
@@ -7,8 +5,8 @@ import {
   ReferenceImportError,
   resolveSyncStore,
   type PortableReference,
-  type ReferenceManifest,
 } from '@shieldedtech/moth-wallet';
+import { readReferenceDirectory, ReferenceDirectoryError } from '../../preseed/reference-directory.js';
 
 /**
  * Load a reference produced elsewhere.
@@ -43,37 +41,19 @@ export default class PreseedImport extends BaseCommand {
     this.verbose = flags.verbose;
 
     const network = await this.getNetworkConfig(flags.network, this.getNetworkOverrides(flags));
-    const dir = args.path;
-    const manifestPath = join(dir, 'manifest.json');
 
-    if (!existsSync(manifestPath)) {
-      this.outputError(
-        'INVALID_INPUT',
-        `No manifest.json in ${dir}.`,
-        'Point this at a directory produced by `preseed export`, or an extension preseed/<network>/ directory.',
-      );
-      this.exit(1);
-      return;
-    }
-
-    let manifest: ReferenceManifest;
+    let bundle: PortableReference;
     try {
-      manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as ReferenceManifest;
+      bundle = readReferenceDirectory(args.path);
     } catch (err) {
-      this.outputError('INVALID_INPUT', `manifest.json is not readable JSON: ${String(err)}`);
-      this.exit(1);
-      return;
-    }
-
-    const files = new Map<string, Uint8Array>();
-    for (const name of ['shielded.dat.gz', 'unshielded.dat.gz', 'dust.dat.gz']) {
-      const at = join(dir, name);
-      if (existsSync(at) && statSync(at).isFile()) {
-        files.set(basename(at), new Uint8Array(readFileSync(at)));
+      if (err instanceof ReferenceDirectoryError) {
+        this.outputError('INVALID_INPUT', err.message, err.hint);
+        this.exit(1);
+        return;
       }
+      throw err;
     }
 
-    const bundle: PortableReference = { manifest, files };
     try {
       const result = await importReference(await resolveSyncStore(), network.id, bundle, {
         force: flags.force,
