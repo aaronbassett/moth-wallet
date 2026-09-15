@@ -1,13 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { gzipSync } from 'node:zlib';
+import { readFileSync } from 'node:fs';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import {
   exportReference,
   importReference,
   ReferenceImportError,
   type PortableReference,
+  type ReferenceManifest,
 } from '../../../src/sync/preseed-portable.js';
+import { inspectDustSnapshot } from '../../../src/sync/dust-reference-collapse.js';
 import {
   cursorWitnessKey,
+  emptyRefCollapsedKey,
   emptyRefHeightKey,
   emptyRefStateKey,
   emptyRefMnemonicKey,
@@ -118,7 +122,7 @@ describe('importReference refuses rather than guesses', () => {
     expect(store.entries.get(emptyRefHeightKey('preprod'))).toBe('500');
 
     const forced = await importReference(store, 'preprod', bundleFor('preprod', 100), { force: true });
-    expect(forced).toEqual({ height: 100, replacedHeight: 500 });
+    expect(forced).toEqual({ height: 100, replacedHeight: 500, dust: 'as-is' });
     expect(store.entries.get(emptyRefHeightKey('preprod'))).toBe('100');
   });
 
@@ -213,7 +217,7 @@ describe('round trip', () => {
     const target = new MemoryStore();
     const result = await importReference(target, 'preprod', bundle);
 
-    expect(result).toEqual({ height: 4242, replacedHeight: null });
+    expect(result).toEqual({ height: 4242, replacedHeight: null, dust: 'as-is' });
     for (const part of ['shielded', 'unshielded', 'dust'] as const) {
       expect(target.entries.get(emptyRefStateKey('preprod', part))).toBe(
         source.entries.get(emptyRefStateKey('preprod', part)),
@@ -354,5 +358,70 @@ describe('witnesses written inline in the manifest', () => {
       /witness-shielded\.json/,
     );
     expect(store.entries).toEqual(before);
+  });
+});
+
+// A bundle cut before references were collapsed carries megabytes of dust state
+// that every wallet seeded from it would deserialize on each launch. Import and
+// export both collapse it, best-effort: a state that cannot be collapsed is still
+// a correct one. See dust-reference-collapse.ts and tests/fixtures/preseed.
+describe('dust trees are collapsed on the way in and out', () => {
+  const NET = 'preview';
+  const UNCOLLAPSED = gunzipSync(
+    readFileSync(new URL('../../fixtures/preseed/preview-519470-dust.dat.gz', import.meta.url)),
+  ).toString('utf8');
+
+  function bundleWithDust(dust: string): PortableReference {
+    const bundle = bundleFor(NET, 519_470);
+    bundle.files.set('dust.dat.gz', new Uint8Array(gzipSync(Buffer.from(dust))));
+    return bundle;
+  }
+
+  it('collapses an uncollapsed dust state on import, and records that it did', async () => {
+    const store = new MemoryStore();
+
+    const result = await importReference(store, NET, bundleWithDust(UNCOLLAPSED));
+
+    expect(result.dust).toBe('collapsed');
+    const stored = store.entries.get(emptyRefStateKey(NET, 'dust'))!;
+    expect(inspectDustSnapshot(stored).stateBytes).toBeLessThan(8_192);
+    expect(inspectDustSnapshot(stored).generationRoot).toBe(inspectDustSnapshot(UNCOLLAPSED).generationRoot);
+    // So the first wallet seeded from it does not collapse it again.
+    expect(store.entries.get(emptyRefCollapsedKey(NET))).toBe('141062');
+  });
+
+  it('stores an already-collapsed dust state byte-for-byte', async () => {
+    const collapsed = new MemoryStore();
+    await importReference(collapsed, NET, bundleWithDust(UNCOLLAPSED));
+    const small = collapsed.entries.get(emptyRefStateKey(NET, 'dust'))!;
+
+    const store = new MemoryStore();
+    const result = await importReference(store, NET, bundleWithDust(small));
+
+    expect(result.dust).toBe('already-collapsed');
+    expect(store.entries.get(emptyRefStateKey(NET, 'dust'))).toBe(small);
+  });
+
+  it('stores a dust state it cannot collapse as it is, and clears any old marker', async () => {
+    // A marker left by the previous reference must not vouch for this one.
+    const store = new MemoryStore();
+    store.entries.set(emptyRefCollapsedKey(NET), '141062');
+
+    const result = await importReference(store, NET, bundleFor(NET, 519_470));
+
+    expect(result.dust).toBe('as-is');
+    expect(store.entries.get(emptyRefStateKey(NET, 'dust'))).toBe('{"dust":true}');
+    expect(store.entries.has(emptyRefCollapsedKey(NET))).toBe(false);
+  });
+
+  it('exports a stored uncollapsed dust state collapsed', async () => {
+    const store = storeWithReference(NET, 519_470);
+    store.entries.set(emptyRefStateKey(NET, 'dust'), UNCOLLAPSED);
+
+    const bundle = (await exportReference(store, NET))!;
+
+    const exported = gunzipSync(bundle.files.get('dust.dat.gz')!).toString('utf8');
+    expect(inspectDustSnapshot(exported).stateBytes).toBeLessThan(8_192);
+    expect(bundle.manifest.parts.dust!.bytes).toBe(Buffer.byteLength(exported));
   });
 });

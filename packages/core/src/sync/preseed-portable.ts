@@ -12,8 +12,10 @@
 // imported here — one format, not two that drift.
 
 import type {CursorWitness} from './cursor-witness.js';
+import {collapseDustReference} from './dust-reference-collapse.js';
 import {
   cursorWitnessKey,
+  emptyRefCollapsedKey,
   emptyRefHeightKey,
   emptyRefStateKey,
   EMPTY_REF_WALLET,
@@ -140,6 +142,42 @@ export interface PortableReference {
   files: Map<string, Uint8Array>;
 }
 
+/** What import did with the dust state a bundle carried. */
+export type DustImportOutcome =
+  /** Collapsed on the way in: the bundle was cut before references were collapsed. */
+  | 'collapsed'
+  /** Stored as given, because it was already collapsed. */
+  | 'already-collapsed'
+  /** Stored as given, because it could not be collapsed: restores slower, still correct. */
+  | 'as-is';
+
+/**
+ * The dust state with its trees collapsed, where that can be done and verified.
+ *
+ * Best-effort on these paths: a state that cannot be collapsed is still a correct
+ * one, just slower to restore, and refusing it would cost a whole reference. The
+ * export script, which cuts the bundles the extension ships, is where a failure
+ * is fatal instead. See dust-reference-collapse.ts.
+ */
+function collapsedIfPossible(dust: string): {json: string; outcome: DustImportOutcome} {
+  try {
+    const {json, report} = collapseDustReference(dust);
+    return {json, outcome: report.changed ? 'collapsed' : 'already-collapsed'};
+  } catch {
+    return {json: dust, outcome: 'as-is'};
+  }
+}
+
+/** A dust snapshot's cursor in the form preseed.ts compares markers against. */
+function dustCursor(json: string): string | null {
+  try {
+    const offset = (JSON.parse(json) as {offset?: string | number}).offset;
+    return offset === undefined ? null : String(BigInt(offset));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read this machine's reference for `networkId` into a portable bundle.
  *
@@ -149,6 +187,10 @@ export interface PortableReference {
  * hand to strangers. The state blobs are public chain data; the mnemonic is not,
  * and there is no reason for a consumer to have it — importing reconstructs
  * nothing from it.
+ *
+ * The dust state leaves collapsed, even when the store still holds a reference
+ * written before references were collapsed, so a bundle never carries megabytes
+ * that every wallet seeded from it would deserialize on each launch.
  *
  * Returns null when there is no usable reference, rather than an empty bundle
  * that would import as a valid-looking reference at height 0.
@@ -173,7 +215,8 @@ export async function exportReference(
     // existed on chain, while the height key still looked consistent. Dust alone
     // was checked, but the same hole is reachable through any part.
     if (value === null || value === undefined) return null;
-    const raw = encoder.encode(value);
+    const state = part === 'dust' ? collapsedIfPossible(value).json : value;
+    const raw = encoder.encode(state);
     const gz = await gzip(raw);
     files.set(`${part}.dat.gz`, gz);
     parts[part] = { bytes: raw.byteLength, gzipBytes: gz.byteLength };
@@ -284,13 +327,17 @@ function carriedWitnesses(bundle: PortableReference): Map<'shielded' | 'dust', s
  *
  * `force` overrides the downgrade check, because re-importing a known-good older
  * bundle to replace a corrupt newer one is a real thing to want.
+ *
+ * The dust state is stored with its trees collapsed where that can be done and
+ * verified, so a bundle cut before references were collapsed still seeds wallets
+ * that restore in milliseconds; `dust` in the result says which happened.
  */
 export async function importReference(
   store: SyncStateStore,
   networkId: string,
   bundle: PortableReference,
   opts: { force?: boolean } = {},
-): Promise<{ height: number; replacedHeight: number | null }> {
+): Promise<{ height: number; replacedHeight: number | null; dust: DustImportOutcome }> {
   if (bundle.manifest.network !== networkId) {
     throw new ReferenceImportError(
       `Bundle is for ${bundle.manifest.network}, not ${networkId}. Importing it would seed wallets from the wrong chain.`,
@@ -340,6 +387,11 @@ export async function importReference(
   }
   const witnesses = carriedWitnesses(bundle);
 
+  // Collapsed before anything is written, with the rest of the preparation.
+  const dustEntry = decoded.find(([part]) => part === 'dust') as [WalletPart, string];
+  const dust = collapsedIfPossible(dustEntry[1]);
+  dustEntry[1] = dust.json;
+
   // Parts first, height last. The height key is what `preseedReferenceStatus`
   // and the seeding guard read to decide a reference is usable, so writing it
   // before the state it describes would advertise a reference that is still
@@ -362,7 +414,15 @@ export async function importReference(
     else await store.delete(key);
   }
 
+  // The collapse marker belongs to the state too: recorded when this state was
+  // verified collapsed, so the first wallet seeded from it does not check again,
+  // and cleared otherwise, so a marker left by the previous reference cannot vouch
+  // for this one.
+  const cursor = dust.outcome === 'as-is' ? null : dustCursor(dust.json);
+  if (cursor !== null) await store.put(emptyRefCollapsedKey(networkId), cursor);
+  else await store.delete(emptyRefCollapsedKey(networkId));
+
   await store.put(emptyRefHeightKey(networkId), String(bundle.manifest.height));
 
-  return { height: bundle.manifest.height, replacedHeight };
+  return { height: bundle.manifest.height, replacedHeight, dust: dust.outcome };
 }

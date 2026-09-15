@@ -58,14 +58,20 @@ export default class PreseedImport extends BaseCommand {
       const result = await importReference(await resolveSyncStore(), network.id, bundle, {
         force: flags.force,
       });
+      const dustNote = {
+        collapsed: ' Its dust trees were collapsed on the way in, so wallets seeded from it restore in milliseconds.',
+        'already-collapsed': '',
+        'as-is': ' Its dust state could not be collapsed and was stored as it is; wallets seeded from it restore slower.',
+      }[result.dust];
       this.outputSuccess({
         network: network.id,
         height: result.height,
         replacedHeight: result.replacedHeight,
+        dust: result.dust,
         message:
-          result.replacedHeight === null
+          (result.replacedHeight === null
             ? `Imported a reference at height ${result.height}. Wallets created from now on start there.`
-            : `Replaced height ${result.replacedHeight} with ${result.height}.`,
+            : `Replaced height ${result.replacedHeight} with ${result.height}.`) + dustNote,
       });
     } catch (err) {
       if (err instanceof ReferenceImportError) {
