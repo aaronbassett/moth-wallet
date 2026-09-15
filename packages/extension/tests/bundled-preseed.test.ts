@@ -89,16 +89,49 @@ describe('installBundledReference', () => {
     expect(store.writes.indexOf(HEIGHT_KEY)).toBe(store.writes.length - 1);
   });
 
-  it('never overwrites a reference already in the store', async () => {
+  it('keeps a reference at least as new as the bundled one', async () => {
+    // A locally built reference, or this same bundle installed earlier.
+    for (const stored of ['2045150', '1985914']) {
+      await serveAssets({ height: 1985914 });
+      const store = recordingStore();
+      await store.put(HEIGHT_KEY, stored);
+      store.writes.length = 0;
+
+      await expect(installBundledReference(NETWORK, store)).resolves.toBe(false);
+      expect(store.writes).toEqual([]);
+      expect(store.entries.get(HEIGHT_KEY)).toBe(stored);
+    }
+  });
+
+  it('replaces an older reference with the bundled one', async () => {
+    // One an earlier release installed: staler, and cut before the dust trees were
+    // collapsed, so every new wallet would keep restoring megabytes.
     await serveAssets({ height: 1985914 });
     const store = recordingStore();
-    // A locally built reference is at least as fresh as anything shipped.
-    await store.put(HEIGHT_KEY, '2045150');
-    store.writes.length = 0;
+    await store.put(HEIGHT_KEY, '1900000');
+    await store.put(stateKey('dust'), 'old-uncollapsed-dust');
 
-    await expect(installBundledReference(NETWORK, store)).resolves.toBe(false);
-    expect(store.writes).toEqual([]);
-    expect(store.entries.get(HEIGHT_KEY)).toBe('2045150');
+    await expect(installBundledReference(NETWORK, store)).resolves.toBe(true);
+    expect(store.entries.get(stateKey('dust'))).toBe('dust-state-blob');
+    expect(store.entries.get(HEIGHT_KEY)).toBe('1985914');
+  });
+
+  it('retires the old height first, so an interrupted replacement is ignored rather than trusted', async () => {
+    // New state under the OLD height would pass the birthday guard for accounts
+    // older than that state, seeding them past their own history.
+    await serveAssets({ height: 1985914 });
+    const store = recordingStore();
+    await store.put(HEIGHT_KEY, '1900000');
+    const failing = {
+      ...store,
+      put: async (key: string, value: string) => {
+        if (key === stateKey('dust')) throw new Error('quota exceeded');
+        await store.put(key, value);
+      },
+    };
+
+    await expect(installBundledReference(NETWORK, failing)).resolves.toBe(false);
+    expect(store.entries.has(HEIGHT_KEY)).toBe(false);
   });
 
   it('stores a witness per cursor-bearing part, so the reference can be verified later', async () => {
