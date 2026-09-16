@@ -11,7 +11,7 @@
 // dropped straight into the extension, and one downloaded from a release can be
 // imported here — one format, not two that drift.
 
-import type {CursorWitness} from './cursor-witness.js';
+import {isCursorWitness, type CursorWitness} from './cursor-witness.js';
 import {collapseDustReference} from './dust-reference-collapse.js';
 import {
   cursorWitnessKey,
@@ -249,32 +249,16 @@ export class ReferenceImportError extends Error {
   }
 }
 
-/**
- * Check a witness written inline in a manifest, and return it in stored form.
- *
- * Inline witnesses are parsed out of a hand-promoted manifest rather than copied
- * from a store that wrote them, so their shape is checked before anything trusts
- * them. A witness the verifier cannot read is skipped by the verifier, and a
- * skipped witness is treated as "unverifiable, allow" — so storing a malformed
- * one would be the same as storing none, while looking like evidence.
- */
+/** Validate either witness transport and produce canonical stored evidence. */
 function inlineWitness(part: 'shielded' | 'dust', value: unknown): string {
   const stream = WITNESS_STREAM[part];
-  const {id, digest, stream: declared} = (typeof value === 'object' && value !== null ? value : {}) as Partial<CursorWitness>;
-  if (
-    declared !== stream ||
-    typeof id !== 'number' ||
-    !Number.isSafeInteger(id) ||
-    id <= 0 ||
-    typeof digest !== 'string' ||
-    !/^[0-9a-f]{16}$/.test(digest)
-  ) {
+  if (!isCursorWitness(value, stream)) {
     throw new ReferenceImportError(
-      `The manifest's ${part} witness is malformed — expected {"stream": "${stream}", "id": <positive integer>, ` +
+      `The ${part} witness is malformed — expected {"stream": "${stream}", "id": <positive integer>, ` +
         '"digest": <16 hex characters>}. A witness that cannot be read cannot vouch for the cursor, so the bundle is refused.',
     );
   }
-  return JSON.stringify({stream, id, digest} satisfies CursorWitness);
+  return JSON.stringify({stream, id: value.id, digest: value.digest} satisfies CursorWitness);
 }
 
 /**
@@ -295,7 +279,17 @@ function carriedWitnesses(bundle: PortableReference): Map<'shielded' | 'dust', s
   for (const part of WITNESSED_PARTS) {
     const file = bundle.files.get(witnessFileName(part));
     if (file) {
-      carried.set(part, decoder.decode(file));
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(decoder.decode(file));
+      } catch {
+        throw new ReferenceImportError(`${witnessFileName(part)} is malformed JSON.`);
+      }
+      const checked = inlineWitness(part, parsed);
+      if (inline?.[part] !== undefined && inlineWitness(part, inline[part]) !== checked) {
+        throw new ReferenceImportError(`The ${part} witness file conflicts with the manifest's witness.`);
+      }
+      carried.set(part, checked);
       continue;
     }
     // Named in the manifest but not delivered is a bundle that lost its evidence
