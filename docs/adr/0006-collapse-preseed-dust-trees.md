@@ -115,12 +115,26 @@ never collapsed.
   workflow runs it against the exported artifact, then the test suite, then the
   CLI end-to-end test against that artifact, and only then records checksums and
   uploads.
-- **The extension replaces an older stored reference.** `installBundledReference`
-  used to write only into an empty store, so an install that had already received
-  an uncollapsed bundle would have kept restoring it for ever. It now replaces a
-  stored reference older than the bundled one, and deletes the old height before
-  writing any part, so an interrupted replacement is ignored rather than trusted.
-  A stored reference at least as new as the bundled one still wins.
+- **The extension retains references assigned to existing wallets.** Before
+  installing a newer bundle it migrates the previous reference and pins eligible
+  wallets to its content hash, separately for each network. New wallets choose
+  the newest birthday-compatible reference. A recovery checks witnesses again;
+  an invalid reference cannot bypass the birthday guard or skip chain history.
+  Parts, witnesses, versions and assignments publish in one IndexedDB transaction.
+  Unassigned versions are collected, retaining the newest version for future wallets.
+- **Preparation runs in a separate worker.** “Speed up new accounts” can refresh
+  from an existing reference without replacing assignments. An interrupted build
+  restarts from the retained verified version; incomplete working files never
+  become published references. Reset epochs prevent late workers from undoing a reset.
+- **A newly generated wallet can contribute its first completed sync.** Core
+  captures all three serialized parts from the same fully synced emission before
+  notifying consumers. The host sends immutable strings, without secret keys,
+  to a separate worker. It rejects any ownership or pending records, replaces
+  public identities with a throwaway identity, collapses and checks DUST trees,
+  captures cursor witnesses, and publishes a new version for future wallets.
+  The current wallet keeps its original assignment and live state. Imported or
+  resumed wallets do not contribute: independently saved partial caches cannot
+  establish the provenance required for a new reference.
 - **The preview and preprod bundles are re-cut and collapsed** in this change:
   preprod rebuilt from genesis, because its old cursors no longer match the
   indexer, and preview refreshed to tip from its previous bundle, whose witnesses
@@ -211,11 +225,24 @@ never collapsed.
   deserialize of the bloated state on that machine (about a minute on preprod), on
   the start-up of the first wallet seeded from it. The marker makes later calls
   free.
-- **Accounts created between two bundled heights can lose their seed.** When the
-  extension replaces an older stored reference with the bundled one, an account
-  created after the old reference's height but before the new one's, and not yet
-  synced, now fails `height <= birthday` against the replacement. It syncs from
-  genesis: slow, still correct.
+- **Existing assignments consume storage.** Old versions remain until their last
+  wallet is removed or the user resets the network's reference state. Newer
+  bundles and background updates do not evict birthday-compatible recovery data.
+- **Ownership checks depend on ledger-v8's representation.** Its public DUST
+  output list hides pending spends and exposes no NIGHT ownership map. Donation
+  therefore also requires both ownership maps to be empty in the pinned ledger
+  debug representation. A changed representation disables donation safely.
+- **Background optimization still uses CPU and memory.** Serialization briefly
+  runs in the wallet worker; expensive ledger work runs in a separate worker.
+  The UI and wallet do not await it, but device resource contention is possible.
+
+### Reset behavior
+
+“Resync from scratch” preserves the behavior before this PR: clear the selected
+wallet's caches and the network's references, assignments and working files, then
+call `installBundledReference` on the next sync. A valid birthday-compatible bundle
+may seed that sync; otherwise it starts from genesis. Reset is not an explicit
+instruction to bypass every bundled reference. Other wallets keep their own caches.
 
 ### Neutral / follow-up
 
@@ -254,6 +281,17 @@ suite. The recorded preview slice is what keeps running.
 
 Tests:
 
+- `reference-versions.test.ts` and `wallet-host-references.test.ts` cover upgrade
+  migration, wallet assignments, birthday eligibility, removal, reset races and
+  background publication without waiting for optimization.
+- `reference-candidate.test.ts` rejects owned and pending records, including the
+  DUST records hidden by its public output list, and checks identity replacement,
+  unchanged roots/cursors and immutable capture.
+- `scripts/test-reference-worker.mjs` loads the production worker in headless
+  Chrome with real WASM and a local indexer fixture. It checks startup, witness
+  capture, identity replacement and main-thread responsiveness. Run after
+  `yarn build`; set `CHROME_BIN` when Chrome is not at the default macOS path.
+  CI runs this with the hosted runner's `google-chrome`.
 - `packages/core/tests/unit/sync/dust-reference-collapse.test.ts` — the transform,
   its refusals, the offline replay, and the pinned `treeFrontier` workaround.
   Fixtures, and how they were recorded: `packages/core/tests/fixtures/preseed/`.

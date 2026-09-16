@@ -240,8 +240,8 @@ describe('round trip', () => {
 
 describe('cursor witnesses travel with a bundle', () => {
   const NET = 'preprod';
-  const WITNESS_SHIELDED = '{"stream":"shielded","id":1431375,"hash":"aa"}';
-  const WITNESS_DUST = '{"stream":"dust","id":1449958,"hash":"bb"}';
+  const WITNESS_SHIELDED = '{"stream":"zswapLedgerEvents","id":1431375,"digest":"aaaaaaaaaaaaaaaa"}';
+  const WITNESS_DUST = '{"stream":"dustLedgerEvents","id":1449958,"digest":"bbbbbbbbbbbbbbbb"}';
 
   function withWitnesses(store: MemoryStore): MemoryStore {
     store.entries.set(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'shielded'), WITNESS_SHIELDED);
@@ -291,13 +291,13 @@ describe('cursor witnesses travel with a bundle', () => {
   it('replaces a stale witness rather than keeping the older one', async () => {
     const target = withWitnesses(storeWithReference(NET, 2_100_000));
     const source = storeWithReference(NET, 2_203_416);
-    source.entries.set(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'dust'), '{"stream":"dust","id":1500000,"hash":"cc"}');
+    source.entries.set(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'dust'), '{"stream":"dustLedgerEvents","id":1500000,"digest":"cccccccccccccccc"}');
     const bundle = await exportReference(source, NET);
 
     await importReference(target, NET, bundle!);
 
     expect(target.entries.get(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'dust'))).toBe(
-      '{"stream":"dust","id":1500000,"hash":"cc"}',
+      '{"stream":"dustLedgerEvents","id":1500000,"digest":"cccccccccccccccc"}',
     );
     // shielded had no witness in the bundle, so the old one must be gone, not kept.
     expect(target.entries.has(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'shielded'))).toBe(false);
@@ -358,6 +358,29 @@ describe('witnesses written inline in the manifest', () => {
       /witness-shielded\.json/,
     );
     expect(store.entries).toEqual(before);
+  });
+
+  it('rejects malformed witness files before overwriting the existing reference', async () => {
+    for (const content of ['not JSON', '{}', JSON.stringify({...INLINE.dust, stream: 'zswapLedgerEvents'})]) {
+      const bundle = withManifestWitnesses(INLINE);
+      bundle.files.set('witness-dust.json', new TextEncoder().encode(content));
+      const store = storeWithReference(NET, 100);
+      const before = new Map(store.entries);
+      await expect(importReference(store, NET, bundle)).rejects.toThrow(/malformed/);
+      expect(store.entries).toEqual(before);
+    }
+  });
+
+  it('rejects conflicting copies, but accepts identical witnesses in both formats', async () => {
+    const bundle = withManifestWitnesses(INLINE);
+    bundle.files.set('witness-dust.json', new TextEncoder().encode(JSON.stringify({...INLINE.dust, id: INLINE.dust.id + 1})));
+    const store = storeWithReference(NET, 100);
+    const before = new Map(store.entries);
+    await expect(importReference(store, NET, bundle)).rejects.toThrow(/conflicts/);
+    expect(store.entries).toEqual(before);
+    bundle.files.set('witness-dust.json', new TextEncoder().encode(JSON.stringify(INLINE.dust, null, 2)));
+    await importReference(store, NET, bundle);
+    expect(JSON.parse(store.entries.get(cursorWitnessKey(NET, EMPTY_REF_WALLET, 'dust'))!)).toEqual(INLINE.dust);
   });
 });
 

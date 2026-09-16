@@ -19,7 +19,9 @@
 // leak "this IP created a wallet on network X at time T" at the moment least
 // worth leaking.
 
-import { cursorWitnessKey, emptyRefStateKey, emptyRefHeightKey, EMPTY_REF_WALLET, type SyncStateStore, type WalletPart } from '@shieldedtech/moth-wallet/sync/sync-store';
+import {type SyncStateStore, type WalletPart} from '@shieldedtech/moth-wallet/sync/sync-store';
+import {isCursorWitness} from '@shieldedtech/moth-wallet/sync/cursor-witness';
+import {migrateReferenceVersions, referenceEpoch, referenceVersionsStatus, saveReferenceVersion, type ReferenceSnapshot, type ReferenceWallet} from '@shieldedtech/moth-wallet/sync/reference-versions';
 
 const PARTS: WalletPart[] = ['shielded', 'unshielded', 'dust'];
 
@@ -78,7 +80,7 @@ function parseManifest(text: string | null): Manifest | null {
     // a wallet silently resuming at the wrong event.
     for (const part of ['shielded', 'dust'] as const) {
       const witness = manifest.witnesses?.[part];
-      if (!witness || typeof witness.digest !== 'string' || !Number.isFinite(witness.id)) return null;
+      if (!isCursorWitness(witness, part === 'dust' ? 'dustLedgerEvents' : 'zswapLedgerEvents')) return null;
     }
     return manifest;
   } catch {
@@ -110,34 +112,29 @@ export function hasBundledReference(networkId: string): Promise<boolean> {
 }
 
 /**
- * Install the bundled reference for `networkId` if the store has none, or has
- * an older one.
+ * Add a newer bundled version after assigning the old reference to existing
+ * eligible wallets. Old assigned versions survive upgrades and DUST rebuilds.
  *
  * Best-effort and idempotent. A missing or unreadable asset is not an error —
  * not every network ships one, and a wallet without a reference syncs the slow
  * way rather than failing. Returns whether anything was written.
  *
- * Writes the height LAST, deliberately. `loadUsableRefStates` treats a reference
- * with no recorded height as unusable, so an interrupted install leaves state
- * that is ignored rather than trusted — the failure mode is a slow sync, never a
- * wallet seeded from half a reference.
+ * Publication is one catalog write containing all parts, witnesses and wallet
+ * assignments. Failed or interrupted installation leaves the old catalog usable.
  */
-export async function installBundledReference(networkId: string, store: SyncStateStore): Promise<boolean> {
+export async function installBundledReference(networkId: string, store: SyncStateStore, wallets: ReferenceWallet[] = []): Promise<boolean> {
   try {
+    // Capture the reset generation before asset fetches can yield. A reset must
+    // not be undone by an installation already in flight.
+    await migrateReferenceVersions(store, networkId, wallets);
+    const epoch = await referenceEpoch(store, networkId);
     const manifest = parseManifest(await fetchText(assetUrl(networkId, 'manifest.json'), false));
-    if (!manifest) return false;
+    if (!manifest || manifest.network !== networkId) return false;
 
-    // A reference at least as new as the bundled one wins: one built on this
-    // device, or this same bundle installed on an earlier unlock.
-    //
-    // An OLDER one is replaced. It predates this release, so it is staler than
-    // what the package carries, and one installed by an earlier release was cut
-    // before its dust trees were collapsed — keeping it would have every new
-    // wallet restoring megabytes the package no longer ships. The one cost: an
-    // account created between the two heights and not yet synced now falls to the
-    // `height <= birthday` guard and syncs from genesis, which is slow but correct.
-    const storedHeight = Number((await store.get(emptyRefHeightKey(networkId)))?.trim());
-    if (Number.isFinite(storedHeight) && storedHeight >= manifest.height) return false;
+    // A local refresh may be newer than the bundle. The catalog already holds
+    // it; do not add redundant older versions without wallet assignments.
+    const status = await referenceVersionsStatus(store, networkId);
+    if (status.height !== null && status.height >= manifest.height) return false;
 
     const states: Partial<Record<WalletPart, string>> = {};
     for (const part of PARTS) {
@@ -148,21 +145,11 @@ export async function installBundledReference(networkId: string, store: SyncStat
       states[part] = value;
     }
 
-    // Retire the old height before touching any part. Otherwise a replacement
-    // interrupted midway leaves the new state under the OLD height, and the
-    // birthday guard — which trusts that height — would seed accounts older than
-    // the state they are given, skipping their history. Without a height the
-    // half-written reference is simply ignored.
-    await store.delete(emptyRefHeightKey(networkId));
-    for (const part of PARTS) await store.put(emptyRefStateKey(networkId, part), states[part]!);
-    // Witnesses before the height, for the same reason the height goes last: the
-    // height is what marks the reference usable, and a reference that reads as
-    // usable without its witnesses is one that skips verification.
-    for (const [part, witness] of Object.entries(manifest.witnesses ?? {})) {
-      await store.put(cursorWitnessKey(networkId, EMPTY_REF_WALLET, part as WalletPart), JSON.stringify(witness));
-    }
-    await store.put(emptyRefHeightKey(networkId), String(manifest.height));
-    return true;
+    return (await saveReferenceVersion(store, {
+      network: networkId, height: manifest.height,
+      shielded: states.shielded!, unshielded: states.unshielded!, dust: states.dust!,
+      witnesses: manifest.witnesses as ReferenceSnapshot['witnesses'],
+    }, {epoch})) !== null;
   } catch {
     // Never let a packaging problem stop a wallet from starting.
     return false;

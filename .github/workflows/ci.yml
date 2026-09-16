@@ -72,6 +72,11 @@ jobs:
       - name: Check committed preseed bundles are collapsed and valid
         run: node scripts/collapse-preseed.mjs --check
 
+      - name: Verify production reference worker in Chrome
+        env:
+          CHROME_BIN: google-chrome
+        run: node scripts/test-reference-worker.mjs
+
   # A brand-new CLI wallet seeded from the committed preprod pre-seed bundle:
   # import it (witnesses included), refresh it, create a wallet, sync it to tip,
   # and relaunch to prove its dust state restores in seconds. It needs no secrets,

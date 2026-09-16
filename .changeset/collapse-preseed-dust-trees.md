@@ -1,5 +1,6 @@
 ---
 '@shieldedtech/moth-wallet': minor
+'@shieldedtech/moth-browser': patch
 '@shieldedtech/moth-cli': minor
 '@shieldedtech/moth-extension': minor
 ---
@@ -47,11 +48,23 @@ Also in this change:
   failed its sync in a loop instead of being refused. Both witness formats — the
   `witness-<part>.json` files `preseed export` writes and the inline witnesses in
   the extension's bundles — are now imported, and a malformed or missing one is
-  refused.
-- **The extension replaces an older stored reference with the bundled one.** It
-  used to install only into an empty store, so a reference an earlier release
-  installed stayed forever. A reference at least as new as the bundled one still
-  wins.
+  refused. Conflicting sidecar and inline witnesses are also refused before
+  any stored reference changes. Legacy unwitnessed imports remain supported.
+- **The extension retains references used by existing wallets.** Per-wallet,
+  per-network assignments preserve birthday-compatible recovery after an upgrade
+  or background refresh. New versions and assignments publish atomically, and
+  cursor witnesses are checked before seeding. Unassigned old versions are
+  collected. Resync still clears caches and references and then attempts to
+  install the bundled reference, as it did before this PR.
+- **IndexedDB writes report success only after the transaction commits**, so a
+  failed publication cannot appear successful after just its write request.
+- **New wallets can prepare the next reference in the background.** After their
+  first full sync, an isolated worker checks immutable snapshots for all
+  ownership and pending records, replaces public identities, optimizes and
+  verifies the trees, and publishes a witnessed reference for future wallets.
+  Live wallets are never modified; imported and resumed wallets do not donate.
+  Settings also offers an explicit background Update action. Reset and wallet
+  removal invalidate any late background result.
 - **The preview and preprod bundles are re-cut and collapsed.** Preprod's
   indexer renumbered its event ids after the previous bundle was cut, so its
   witnesses no longer matched and the extension refused it.

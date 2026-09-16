@@ -17,6 +17,7 @@ import {cursorWitnessKey, emptyRefCollapsedKey, emptyRefHeightKey, emptyRefMnemo
 import {collapseDustReference} from './dust-reference-collapse.js';
 import {
   compareWitness,
+  isCursorWitness,
   readEventWitness,
   type CursorWitness,
   type WitnessStream,
@@ -144,8 +145,10 @@ async function referenceCursorsStillValid(
     try {
       stored = JSON.parse(raw) as CursorWitness;
     } catch {
-      continue;
+      onProgress?.(`Pre-seed: malformed ${part} witness — refusing the reference`);
+      return false;
     }
+    if (!isCursorWitness(stored, witnessStreamFor(part)!)) return false;
     let observed: CursorWitness | null = null;
     try {
       observed = await readEventWitness(network.indexerUrl, stored.stream, stored.id);

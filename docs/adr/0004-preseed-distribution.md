@@ -317,14 +317,13 @@ are re-cut in this change: preprod rebuilt from genesis, since its old cursors n
 longer match, and preview refreshed to tip from its previous bundle, whose
 witnesses still matched.
 
-**The extension replaces an older stored reference.** `installBundledReference`
-used to write only into an empty store, so a reference an earlier release
-installed stayed for good, however stale or uncollapsed. The self-healing property
-in §3 covered eviction, not staleness. It now replaces a stored reference older
-than the bundled one, deleting the old height before writing any part so an
-interrupted replacement is ignored rather than trusted. The cost is that an
-account created between the two heights, and not yet synced, fails
-`height <= birthday` against the replacement and syncs from genesis.
+**The extension retains versions assigned to existing wallets.**
+`installBundledReference` migrates the previous reference and pins eligible
+wallets before adding a newer bundle. Existing usable assignments survive
+upgrades and background refreshes; new wallets use the newest birthday-compatible
+version. Publication is atomic and unassigned old versions are collected. This
+supersedes the replacement approach initially proposed in this PR; see ADR 0006
+for the full lifecycle and background snapshot conversion.
 
 **The qanet bundle is removed.** The qanet indexer was unavailable (HTTP 503)
 throughout this work, so its bundle could be neither re-cut nor verified, and by
