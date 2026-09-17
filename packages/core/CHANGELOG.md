@@ -1,5 +1,185 @@
 # @shieldedtech/moth-wallet
 
+## 0.14.0
+
+### Minor Changes
+
+- 8499d74: Collapse the DUST trees in pre-seed references, so a wallet seeded from one
+  restores its dust state in milliseconds instead of about a minute on every
+  launch.
+
+  A new wallet inherits the reference's dust state, and restoring it is one
+  `DustLocalState.deserialize` each time the CLI, TUI or extension starts the
+  wallet. On preprod that state was 5,474,535 bytes, nearly all of it a DUST
+  generation tree bloated by a ledger-v8 8.1.x defect, and the deserialize took
+  ~57s. Collapsing the populated range of the generation and commitment trees
+  takes it to 3,666 bytes and ~7 ms, with the same roots and frontier:
+
+  | Network | Dust state | Deserialize |
+  | --- | --- | --- |
+  | preprod | 5,474,535 B → 3,666 B | ~57s → ~7 ms |
+  | preview | 131,427 B → 3,564 B | 65 ms → 7 ms |
+
+  A collapsed reference syncs forward exactly as the original: replaying the
+  71,507 preprod events that followed the reference on both — 940 of them dtime
+  updates landing inside the collapsed range — gave identical roots, balance and
+  UTXOs after every batch. The unit tests replay a recorded preview slice to keep
+  proving it.
+
+  The collapse is verified before anything uses it, refuses any state that owns
+  DUST (collapsing an owned leaf panics on 8.1.x), and runs wherever a reference
+  is produced or handed out: `moth preseed build`, `refresh`, `import` and
+  `export`, the extension's "Speed up new accounts" setting, and the first time a
+  reference stored by an earlier version seeds a wallet. **Existing wallets are
+  not affected**: only the reference is collapsed, so a wallet seeded before this
+  change keeps the dust state it was seeded with (and collapsing a wallet that
+  holds DUST is unsafe on ledger-v8 8.1.x).
+
+  `scripts/collapse-preseed.mjs` collapses a bundle directory, and with `--check`
+  proves one is collapsed and valid. `scripts/export-preseed.mjs` now collapses
+  on the way out and refuses an export it cannot verify.
+
+  Also in this change:
+
+  - **`moth preseed import` no longer drops a bundle's cursor witnesses.** It
+    read only the three `.dat.gz` parts, so every imported reference was
+    unverifiable, and a bundle cut before an indexer renumbering imported and then
+    failed its sync in a loop instead of being refused. Both witness formats — the
+    `witness-<part>.json` files `preseed export` writes and the inline witnesses in
+    the extension's bundles — are now imported, and a malformed or missing one is
+    refused. Conflicting sidecar and inline witnesses are also refused before
+    any stored reference changes. Legacy unwitnessed imports remain supported.
+  - **The extension retains references used by existing wallets.** Per-wallet,
+    per-network assignments preserve birthday-compatible recovery after an upgrade
+    or background refresh. New versions and assignments publish atomically, and
+    cursor witnesses are checked before seeding. Unassigned old versions are
+    collected. Resync still clears caches and references and then attempts to
+    install the bundled reference, as it did before this PR.
+  - **IndexedDB writes report success only after the transaction commits**, so a
+    failed publication cannot appear successful after just its write request.
+  - **New wallets can prepare the next reference in the background.** After their
+    first full sync, an isolated worker checks immutable snapshots for all
+    ownership and pending records, replaces public identities, optimizes and
+    verifies the trees, and publishes a witnessed reference for future wallets.
+    Live wallets are never modified; imported and resumed wallets do not donate.
+    Settings also offers an explicit background Update action. Reset and wallet
+    removal invalidate any late background result.
+  - **The preview and preprod bundles are re-cut and collapsed.** Preprod's
+    indexer renumbered its event ids after the previous bundle was cut, so its
+    witnesses no longer matched and the extension refused it.
+  - **The qanet bundle is removed.** qanet's indexer was unavailable, so it could
+    not be re-cut or verified. qanet wallets sync from genesis, and the extension
+    offers to build a reference on the device, until a bundle returns.
+
+  CI now checks the committed bundles are collapsed on every pull request and
+  before packaging the extension, and runs an end-to-end test on every pull
+  request that seeds a new CLI wallet on preprod from the committed bundle and
+  checks it restores in seconds (advisory: it depends on the live preprod
+  indexer). The manual preseed workflow collapses, verifies and end-to-end tests
+  each bundle before uploading it. See
+  docs/adr/0006-collapse-preseed-dust-trees.md.
+
+### Patch Changes
+
+- Combine retained, collapsed references with DUST-only recovery for restored or
+  older wallets. When no birthday-compatible reference exists, the extension offers
+  a witnessed candidate to core's DUST-history check without changing wallet
+  assignments, seeding other parts, or enabling imported-wallet contributions.
+
+  Treat malformed history responses, unknown event types, incorrect subscription
+  IDs and invalid tree sizes as unknown history instead of evidence that no DUST
+  history exists.
+- 77edf22: Replace the wallet SDK's DUST fee-balancing loop with one that terminates.
+
+  The SDK's `computeBalancingRecipe` (`wallet-sdk-dust-wallet` 4.2.0) re-selects
+  dust coins until they cover the fee of the transaction they produce, with no
+  iteration cap and no progress check. It also seeds its first pass with a
+  negative dust imbalance and every later pass with a positive fee; the balancer
+  reads the positive seed as a surplus, adds an output and selects nothing, so
+  only the first pass can ever converge. A wallet holding several part-drained
+  dust coins under-covers on that first pass and the loop then spins forever,
+  building and proof-erasing a WASM transaction on the calling thread each time
+  until the process runs out of memory.
+
+  Moth now supplies its own transacting capability through the SDK's documented
+  `V1Builder.withTransacting` seam (`sync/dust-transacting.ts`). It keeps the
+  SDK's fee arithmetic — `dryRunFee` and `calculateFee`, the WASM parts — and
+  replaces only the control flow: each pass covers the outstanding deficit from
+  coins not yet selected, then re-prices the transaction with everything selected
+  so far. A pass that does not converge has strictly grown the input set, so the
+  loop is bounded by the number of coins; running out surfaces as the SDK's own
+  `InsufficientFundsError`. Both `estimateFee` and `balanceTransactions` route
+  through the replaced method, so the fee preview and the real spend take the
+  same path. Coin selection order is unchanged.
+
+  Trade-off: this couples Moth to the SDK's exported implementation class and
+  three of its methods. The test suite pins that surface so an SDK upgrade that
+  changes it fails in CI rather than silently reverting to the non-terminating
+  loop. `effect` becomes a direct dependency of `@shieldedtech/moth-wallet` (it
+  was already in the tree via the SDK) because the capability returns the SDK's
+  `Either` values. The same loop is proposed upstream in
+  `docs/upstream-issues/dust-fee-balancing-nontermination.md`.
+- aa3c276: Pay DUST fees from the largest coin first, so fee balancing terminates.
+
+  The wallet SDK's dust fee balancer (`wallet-sdk-dust-wallet` 4.2.0,
+  `computeBalancingRecipe`) loops until the coins it selected cover the fee that
+  selecting them produced, with no iteration cap and no progress check. Its
+  default selector takes the smallest coin first, so a wallet holding several
+  part-drained DUST coins spends a handful of them, which enlarges the
+  transaction, which raises the fee past what those coins cover — and the loop
+  never exits. It also never fails: only the first pass can converge, because
+  that pass is seeded with a negative dust imbalance while every later pass is
+  seeded with a positive fee, which sends the balancer down its add-an-output
+  branch and selects no inputs at all. Each pass deserialises and erases proofs
+  on a fresh WASM transaction while holding the thread, so the wallet stops
+  responding and its WASM heap grows until the process dies.
+
+  Moth now sets largest-first selection on the dust wallet through the SDK's
+  documented `V1Builder.withCoinSelection` extension point
+  (`sync/dust-coin-selection.ts`), on both the restore-from-cache and
+  start-from-secret-key paths. One coin near its generation cap covers a fee
+  outright, so the first pass converges — which is the only pass that can.
+
+  This costs nothing in DUST fragmentation: a dust spend is one-in-one-out (the
+  ledger nullifies the coin and mints a successor worth the remainder), coin
+  count is pinned to the number of registered NIGHT UTXOs, and a coin's value
+  regenerates toward its cap. Draining the fullest coin therefore rotates across
+  backing UTXOs on its own as the drained ones refill, and produces a smaller
+  transaction than spending eight coins to reach the same fee.
+
+  **This is a mitigation, not a fix.** A wallet whose dust is spread evenly
+  across coins that are all far below fee size still spins, because no single
+  coin covers the fee — pinned as a test, and filed upstream with the iteration
+  traces in `docs/upstream-issues/dust-fee-balancing-nontermination.md`, which
+  asks for the progress check that would close it. Transaction construction,
+  signing, and proving are unchanged.
+- 19a1a23: Pre-seed the DUST state of restored wallets when the indexer proves it safe.
+
+  Pre-seeding only ran for a wallet whose birthday was at or after the reference
+  height — the birthday being the wallet's only local proof that it has no earlier
+  history to skip. A wallet restored from a mnemonic or hex seed has no birthday,
+  and a wallet whose cache was cleared has one that predates the reference, so
+  both walked DUST from genesis: 1.4M events at ~293 events/s, about 78 minutes on
+  preprod, of which dust is 99%.
+
+  For the dust part there is a second proof. All of a wallet's DUST descends from
+  generation entries owned by its dust key, and the indexer can say whether that
+  key owned any entry at the reference height: `Block.dustGenerationEndIndex`
+  gives the generation tree's size `N` at that height, and the bounded
+  `dustGenerations(dustAddress, 0, N − 1)` subscription ends with `complete` — no
+  owned entry before it is a positive "none" (~1.1 s on preprod). When the
+  birthday rule fails and the dust cache is missing, `startWalletSync` runs that
+  probe and on "none" seeds dust alone from the reference; shielded and
+  unshielded still scan from genesis, which is quick. The hour becomes the
+  reference's deserialize plus catch-up.
+
+  Fails closed: an owned entry, an indexer without the field (pre-4.2), a timeout
+  or an error all keep the genesis walk, with the reason in the sync progress
+  line. The decision is the pure `preSeedPlan` (`sync/preseed-parts.ts`); the
+  probe is `sync/dust-history.ts`; `IndexerClient.getDustGenerationEndIndex` and
+  `dustAddressForKey` (a dust address from the typed key, no seed needed) support
+  it. ADR 0003 records the exception.
+
 ## 0.13.0
 
 ### Minor Changes
