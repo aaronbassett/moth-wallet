@@ -85,8 +85,10 @@ the release tag manually.
 - **Settings → Network → Clear cache and resync** forgets everything synced for
   the active account on its network — sync state, cached balances, pending
   activity, and the network's reference versions and assignments. The next sync
-  installs the bundled reference again and uses it only if its witnesses and
-  birthday check pass; otherwise it syncs from genesis.
+  installs the bundled reference again and uses it if its witnesses and
+  birthday check pass. Without a compatible birthday, DUST alone may use a
+  witnessed reference if the indexer confirms no earlier DUST generation
+  history; other missing parts sync from genesis.
   It is the recovery for a local devnet that was taken down and brought back up
   as a new chain: every cached artefact then describes a chain that no longer
   exists, and the sync engine cannot tell. Nothing is spent; on the new chain the

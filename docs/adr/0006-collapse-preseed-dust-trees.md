@@ -122,6 +122,12 @@ never collapsed.
   an invalid reference cannot bypass the birthday guard or skip chain history.
   Parts, witnesses, versions and assignments publish in one IndexedDB transaction.
   Unassigned versions are collected, retaining the newest version for future wallets.
+- **DUST-only recovery can use a newer reference after a history check.** If no
+  birthday-compatible version is available, the extension can offer a fully
+  witnessed candidate to core. Only a completed indexer query showing no owned
+  DUST generation history before that reference permits DUST seeding. Shielded
+  and unshielded retain their birthday gate; the candidate does not replace a
+  wallet assignment or make imported wallets eligible to contribute snapshots.
 - **Preparation runs in a separate worker.** “Speed up new accounts” can refresh
   from an existing reference without replacing assignments. An interrupted build
   restarts from the retained verified version; incomplete working files never
@@ -241,7 +247,8 @@ never collapsed.
 “Resync from scratch” preserves the behavior before this PR: clear the selected
 wallet's caches and the network's references, assignments and working files, then
 call `installBundledReference` on the next sync. A valid birthday-compatible bundle
-may seed that sync; otherwise it starts from genesis. Reset is not an explicit
+may seed that sync. Otherwise DUST alone may use a witnessed reference after the
+history check in ADR 0003; parts without either proof start from genesis. Reset is not an explicit
 instruction to bypass every bundled reference. Other wallets keep their own caches.
 
 ### Neutral / follow-up
