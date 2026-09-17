@@ -25,7 +25,11 @@ vi.mock('../lib/offscreen/reference-jobs', () => ({runReferenceJob: mocks.run, c
 vi.mock('../lib/offscreen/bundled-preseed', () => ({installBundledReference: mocks.install, hasBundledReference: async () => true}));
 vi.mock('@shieldedtech/moth-wallet/sync/reference-versions', async importOriginal => {
   const actual = await importOriginal<typeof import('@shieldedtech/moth-wallet/sync/reference-versions')>();
-  return {...actual, selectReferenceVersion: (store: any, network: any, wallet: any) => actual.selectReferenceVersion(store, network, wallet, async () => true)};
+  return {
+    ...actual,
+    selectReferenceVersion: (store: any, network: any, wallet: any) => actual.selectReferenceVersion(store, network, wallet, async () => true),
+    selectDustReferenceCandidate: (store: any, network: any) => actual.selectDustReferenceCandidate(store, network, async () => true),
+  };
 });
 import {walletCreate, syncEnsure, syncStop, syncCacheReset} from '../lib/offscreen/wallet-host';
 import {migrateReferenceVersions, saveReferenceVersion, selectReferenceVersion, registerReferenceWallet, referenceVersionsStatus} from '@shieldedtech/moth-wallet/sync/reference-versions';
@@ -58,6 +62,25 @@ beforeEach(() => {
 afterEach(async () => {await syncStop();});
 
 describe('wallet host reference lifecycle', () => {
+  it.each([undefined, 150])('passes a DUST candidate to core for birthday %s without enabling contributions', async (birthday) => {
+    mocks.list.mockResolvedValue([{name: 'restored', birthday}]);
+    mocks.birthdayOn.mockResolvedValue(birthday);
+    await syncEnsure('unused', 'restored', network);
+    expect(options().reference.height).toBe(200);
+    expect(options().onInitialSyncSnapshot).toBeUndefined();
+    expect(await selected('restored', birthday ?? 0)).toBeNull();
+  });
+
+  it('does not offer the DUST fallback when DUST is already cached', async () => {
+    mocks.list.mockResolvedValue([{name: 'imported'}]);
+    mocks.birthdayOn.mockResolvedValue(undefined);
+    await store.put(syncStateKey('preview', 'imported', 'dust'), 'cached-dust');
+    await syncEnsure('unused', 'imported', network);
+    expect(options().reference).toBeNull();
+    expect(options().onInitialSyncSnapshot).toBeUndefined();
+    expect(await store.get(syncStateKey('preview', 'imported', 'dust'))).toBe('cached-dust');
+  });
+
   it('pins existing wallets before an upgrade, and a just-created wallet to the newest version', async () => {
     await saveReferenceVersion(store, snapshot(100));
     await walletCreate('new', 'password', 'preview', 250);

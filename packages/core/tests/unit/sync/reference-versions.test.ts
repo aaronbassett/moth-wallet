@@ -3,7 +3,7 @@ import {InMemorySyncStateStore, emptyRefHeightKey, emptyRefStateKey, cursorWitne
 import {
   REFERENCE_CATALOG_KEY, migrateReferenceVersions, saveReferenceVersion, selectReferenceVersion,
   registerReferenceWallet, referenceEpoch, resetReferenceVersions, forgetReferenceWallet,
-  referenceContributionToken, referenceStillValid, type ReferenceSnapshot,
+  referenceContributionToken, referenceStillValid, selectDustReferenceCandidate, type ReferenceSnapshot,
 } from '../../../src/sync/reference-versions.js';
 
 const network = {id: 'preview', indexerUrl: 'http://unused.invalid'};
@@ -60,6 +60,35 @@ describe('reference versions and wallet assignments', () => {
     expect(await selectReferenceVersion(store, network, {name: 'imported'}, check)).toBeNull();
     expect(await selectReferenceVersion(store, network, {name: 'older', birthday: 150}, check)).toBeNull();
     expect(check).not.toHaveBeenCalled();
+  });
+
+  it('offers a witnessed DUST candidate without assigning it as a wallet recovery reference', async () => {
+    const store = new InMemorySyncStateStore();
+    await saveReferenceVersion(store, snapshot(200));
+    const check = vi.fn(good);
+    expect((await selectDustReferenceCandidate(store, network, check))?.height).toBe(200);
+    expect(check).toHaveBeenCalledOnce();
+    expect((await catalog(store)).wallets).toEqual({});
+    expect((await catalog(store)).contributors).toEqual({});
+  });
+
+  it('requires witnessed candidates even when legacy references allow missing witnesses', async () => {
+    const store = new InMemorySyncStateStore();
+    await legacy(store, {...snapshot(100), witnesses: {}});
+    await migrateReferenceVersions(store, 'preview', []);
+    const check = vi.fn(good);
+    expect(await selectDustReferenceCandidate(store, network, check)).toBeNull();
+    expect(check).not.toHaveBeenCalled();
+  });
+
+  it('rejects DUST candidates that fail witness verification or are invalidated during the check', async () => {
+    const store = new InMemorySyncStateStore();
+    await saveReferenceVersion(store, snapshot(200));
+    expect(await selectDustReferenceCandidate(store, network, async () => false)).toBeNull();
+    expect(await selectDustReferenceCandidate(store, network, async () => {
+      await resetReferenceVersions(store, 'preview');
+      return true;
+    })).toBeNull();
   });
 
   it('checks the pinned version against the current indexer on every recovery', async () => {

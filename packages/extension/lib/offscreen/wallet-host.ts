@@ -6,7 +6,7 @@
 import { relayRetry, setRelayUrl } from './relay-socket';
 import { installBundledReference, hasBundledReference } from './bundled-preseed';
 import {cancelReferenceJob, runReferenceJob} from './reference-jobs';
-import {finishReferenceContribution, forgetReferenceWallet, referenceContributionToken, referenceEpoch, referenceVersionsStatus, registerReferenceWallet, resetReferenceVersions, saveReferenceVersion, selectReferenceVersion} from '@shieldedtech/moth-wallet/sync/reference-versions';
+import {finishReferenceContribution, forgetReferenceWallet, referenceContributionToken, referenceEpoch, referenceVersionsStatus, registerReferenceWallet, resetReferenceVersions, saveReferenceVersion, selectReferenceVersion, selectDustReferenceCandidate} from '@shieldedtech/moth-wallet/sync/reference-versions';
 import {syncStateKey} from '@shieldedtech/moth-wallet/sync/sync-store';
 import { requestMeter, type MeterSnapshot } from './request-meter';
 import {
@@ -361,15 +361,20 @@ export async function syncEnsure(
 
   // Wallets created by the extension store the chain tip at creation time as
   // their birthday; it lets the first sync pre-seed at tip instead of
-  // scanning from genesis. Imported wallets have none and scan everything.
+  // scanning from genesis. Without one, only DUST can qualify via a history probe.
   const birthday = (await getMoth(network.id).wallets.list())
     .find((wallet) => wallet.name === walletName)?.birthday;
   const cachedParts = await Promise.all((['shielded', 'unshielded', 'dust'] as const)
     .map(part => referenceStore.get(syncStateKey(network.id, walletName, part))));
   const missing = cachedParts.some(state => !state);
-  const reference = missing
+  let reference = missing
     ? await selectReferenceVersion(referenceStore, network, {name: walletName, birthday}).catch(() => null)
     : null;
+  if (!reference && !cachedParts[2]) {
+    // Keep birthday-based recovery assignments intact. This candidate may seed
+    // DUST only after core confirms no owned generation history before its height.
+    reference = await selectDustReferenceCandidate(referenceStore, network).catch(() => null);
+  }
   const epoch = await referenceEpoch(referenceStore, network.id).catch(() => null);
   let contributionToken = birthday && epoch
     ? await referenceContributionToken(referenceStore, network.id, walletName).catch(() => null) : null;

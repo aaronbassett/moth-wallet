@@ -200,6 +200,22 @@ export async function selectReferenceVersion(
   }
   return null;
 }
+
+/**
+ * A candidate for core's DUST-history probe, not permission to seed a wallet.
+ * No birthday or wallet assignment is changed. Unlike legacy birthday-based
+ * recovery, this fallback requires complete witnesses before consulting history.
+ */
+export async function selectDustReferenceCandidate(
+  store: SyncStateStore, config: Pick<NetworkConfig, 'id' | 'indexerUrl'>,
+  check: CheckReference = ref => referenceStillValid(ref, config.indexerUrl),
+): Promise<ReferenceVersion | null> {
+  return selectReferenceVersion(store, config, undefined, async ref => {
+    try { validateReferenceSnapshot(ref); } catch { return false; }
+    return check(ref);
+  });
+}
+
 export async function referenceVersionsStatus(store: SyncStateStore, networkId: string): Promise<{ready: boolean; height: number | null}> {
   return transact(store, catalog => {
     const newest = candidates(network(catalog, networkId))[0];
